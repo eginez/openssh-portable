@@ -306,6 +306,56 @@ w32_io_on_select(struct w32_io* pio, BOOL rd)
 	}                                                                   \
 } while (0)
 
+/* WSA error to errno conversion */
+static int
+errno_from_WSAError(int wsaerrno)
+{
+	switch (wsaerrno) {
+	case WSAEWOULDBLOCK:	return EAGAIN;
+	case WSAEFAULT:		return EFAULT;
+	case WSAEINVAL:		return EINVAL;
+	case WSAECONNABORTED:	return ECONNABORTED;
+	case WSAETIMEDOUT:	return ETIMEDOUT;
+	case WSAECONNREFUSED:	return ECONNREFUSED;
+	case WSAEINPROGRESS:	return EINPROGRESS;
+	case WSAESHUTDOWN:	return ECONNRESET;
+	case WSAENOTCONN:	return ENOTCONN;
+	case WSAECONNRESET:	return ECONNRESET;
+	default:		return wsaerrno - 10000;
+	}
+}
+
+/* True iff this w32_io is an AF_UNIX socket backed by native Winsock AF_UNIX. */
+#define IS_AFUNIX_WINSOCK(pio) \
+	((pio)->internal.afunix_backend == AFUNIX_BACKEND_WINSOCK)
+
+/* True iff this w32_io is the legacy named-pipe AF_UNIX backend. */
+#define IS_AFUNIX_PIPE(pio) \
+	((pio)->internal.afunix_backend == AFUNIX_BACKEND_PIPE)
+
+/* AF_UNIX socket operation helpers (native Winsock) */
+static int
+afunix_shutdown(struct w32_io* pio, int how)
+{
+	return shutdown((SOCKET)pio->handle, how);
+}
+
+static BOOL
+afunix_is_io_available(struct w32_io* pio, BOOL rd)
+{
+	fd_set read_set;
+	struct timeval tv;
+
+	if (rd && pio->internal.afunix_state == AFUNIX_LISTENING) {
+		FD_ZERO(&read_set);
+		FD_SET((SOCKET)pio->handle, &read_set);
+		tv.tv_sec = 0;
+		tv.tv_usec = 0;
+		return select(0, &read_set, NULL, NULL, &tv) > 0;
+	}
+	return FALSE;
+}
+
 int
 w32_socket(int domain, int type, int protocol)
 {
@@ -315,42 +365,92 @@ w32_socket(int domain, int type, int protocol)
 	errno = 0;
 	if (min_index == -1)
 		return -1;
-	
+
 	if (domain == AF_UNIX && type == SOCK_STREAM) {
-		pio = fileio_afunix_socket();		
-		if (pio == NULL)
+		SOCKET sock;
+		pio = (struct w32_io*)malloc(sizeof(struct w32_io));
+		if (!pio) {
+			errno = ENOMEM;
 			return -1;
-		pio->type = NONSOCK_FD;
+		}
+		memset(pio, 0, sizeof(struct w32_io));
+		sock = socket(AF_UNIX, SOCK_STREAM, protocol);
+		if (sock == INVALID_SOCKET) {
+			errno = errno_from_WSAError(WSAGetLastError());
+			free(pio);
+			return -1;
+		}
+		pio->type = SOCK_FD;
+		pio->handle = (HANDLE)sock;
+		pio->internal.state = SOCK_INITIALIZED;
+		pio->internal.afunix_state = AFUNIX_INITIALIZED;
+		pio->internal.afunix_backend = AFUNIX_BACKEND_WINSOCK;
 	} else {
 		pio = socketio_socket(domain, type, protocol);
 		if (pio == NULL)
 			return -1;
 		pio->type = SOCK_FD;
-	}	
+	}
 
 	fd_table_set(pio, min_index);
-	debug4("socket:%d, socktype:%d, io:%p, fd:%d ", pio->sock, type, pio, min_index);
+	debug4("socket:%d, socktype:%d, io:%p, fd:%d ", domain == AF_UNIX ? 0 : (int)pio->sock, type, pio, min_index);
 	return min_index;
 }
 
 int
 w32_accept(int fd, struct sockaddr* addr, int* addrlen)
 {
-	CHECK_FD(fd);
-	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
-	int min_index = fd_table_get_min_index();
+	struct w32_io* listen_pio;
+	int min_index;
 	struct w32_io* pio = NULL;
+	SOCKET conn_sock;
 
+	CHECK_FD(fd);
+	listen_pio = fd_table.w32_ios[fd];
+
+	/* AF_UNIX accept - use standard POSIX accept */
+	if (listen_pio->internal.afunix_state == AFUNIX_LISTENING) {
+		int addrlen_int;
+		addrlen_int = addrlen ? *addrlen : (int)sizeof(int);
+		conn_sock = accept((SOCKET)listen_pio->handle, addr, addrlen ? &addrlen_int : NULL);
+		if (conn_sock == INVALID_SOCKET) {
+			errno = errno_from_WSAError(WSAGetLastError());
+			return -1;
+		}
+		min_index = fd_table_get_min_index();
+		if (min_index == -1) {
+			closesocket(conn_sock);
+			return -1;
+		}
+		pio = (struct w32_io*)malloc(sizeof(struct w32_io));
+		if (!pio) {
+			errno = ENOMEM;
+			closesocket(conn_sock);
+			return -1;
+		}
+		memset(pio, 0, sizeof(struct w32_io));
+		pio->type = SOCK_FD;
+		pio->handle = (HANDLE)conn_sock;
+		pio->internal.state = SOCK_READY;
+		pio->internal.afunix_state = AFUNIX_READY;
+		pio->internal.afunix_backend = AFUNIX_BACKEND_WINSOCK;
+		fd_table_set(pio, min_index);
+		debug4("afunix accept: fd:%d, io:%p", min_index, pio);
+		return min_index;
+	}
+
+	CHECK_SOCK_IO(listen_pio);
+	min_index = fd_table_get_min_index();
 	if (min_index == -1)
 		return -1;
 
-	if (fd_table.w32_ios[fd]->type == NONSOCK_FD) {
+	if (listen_pio->type == NONSOCK_FD) {
 		errno = ENOTSUP;
 		verbose("Unix domain server sockets are not supported");
 		return -1;
 	}
 
-	pio = socketio_accept(fd_table.w32_ios[fd], addr, addrlen);
+	pio = socketio_accept(listen_pio, addr, addrlen);
 	if (!pio)
 		return -1;
 
@@ -395,70 +495,151 @@ w32_getpeername(int fd, struct sockaddr* name, int* namelen)
 int
 w32_listen(int fd, int backlog)
 {
+	struct w32_io* pio;
+
 	CHECK_FD(fd);
-	if (fd_table.w32_ios[fd]->type == NONSOCK_FD) {
+	pio = fd_table.w32_ios[fd];
+	if (IS_AFUNIX_WINSOCK(pio)) {
+		int ret;
+		ret = listen((SOCKET)pio->handle, backlog);
+		if (ret == SOCKET_ERROR) {
+			errno = errno_from_WSAError(WSAGetLastError());
+			return -1;
+		}
+		pio->internal.afunix_state = AFUNIX_LISTENING;
+		pio->internal.state = SOCK_LISTENING;
+		return 0;
+	}
+
+	if (pio->type == NONSOCK_FD) {
 		errno = ENOTSUP;
 		verbose("Unix domain server sockets are not supported");
 		return -1;
 	}
 
-	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
-	return socketio_listen(fd_table.w32_ios[fd], backlog);
+	CHECK_SOCK_IO(pio);
+	return socketio_listen(pio, backlog);
 }
 
 int
 w32_bind(int fd, const struct sockaddr *name, int namelen)
 {
+	struct w32_io* pio;
+
 	CHECK_FD(fd);
-	if (fd_table.w32_ios[fd]->type == NONSOCK_FD) {
+	pio = fd_table.w32_ios[fd];
+	if (IS_AFUNIX_WINSOCK(pio)) {
+		int ret;
+		ret = bind((SOCKET)pio->handle, name, namelen);
+		if (ret == SOCKET_ERROR) {
+			errno = errno_from_WSAError(WSAGetLastError());
+			return -1;
+		}
+		return 0;
+	}
+
+	if (pio->type == NONSOCK_FD) {
 		errno = ENOTSUP;
 		verbose("Unix domain server sockets are not supported");
 		return -1;
 	}
 
-	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
-	return socketio_bind(fd_table.w32_ios[fd], name, namelen);
+	CHECK_SOCK_IO(pio);
+	return socketio_bind(pio, name, namelen);
 }
 
 int
 w32_connect(int fd, const struct sockaddr* name, int namelen)
 {
+	struct w32_io* pio;
 	CHECK_FD(fd);
+	pio = fd_table.w32_ios[fd];
 
-	if (fd_table.w32_ios[fd]->type == NONSOCK_FD) {
-		struct sockaddr_un* addr = (struct sockaddr_un*)name;
-		return fileio_connect(fd_table.w32_ios[fd], addr->sun_path);
+	if (IS_AFUNIX_WINSOCK(pio)) {
+		int ret = connect((SOCKET)pio->handle, name, namelen);
+		if (ret == SOCKET_ERROR) {
+			errno = errno_from_WSAError(WSAGetLastError());
+			return -1;
+		}
+		return 0;
 	}
 
-	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
-	return socketio_connect(fd_table.w32_ios[fd], name, namelen);
+	if (pio->type == NONSOCK_FD) {
+		struct sockaddr_un* addr = (struct sockaddr_un*)name;
+		return fileio_connect(pio, addr->sun_path);
+	}
+
+	CHECK_SOCK_IO(pio);
+	return socketio_connect(pio, name, namelen);
 }
 
 int
 w32_recv(int fd, void *buf, size_t len, int flags)
 {
-	CHECK_FD(fd);
+	struct w32_io* pio;
 
-	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
-	return socketio_recv(fd_table.w32_ios[fd], buf, len, flags);
+	CHECK_FD(fd);
+	pio = fd_table.w32_ios[fd];
+
+	/* AF_UNIX recv - use native Winsock recv */
+	if (IS_AFUNIX_WINSOCK(pio)) {
+		int ret = recv((SOCKET)pio->handle, (char*)buf, (int)len, flags);
+		if (ret == SOCKET_ERROR) {
+			errno = errno_from_WSAError(WSAGetLastError());
+			return -1;
+		}
+		return ret;
+	}
+
+	CHECK_SOCK_IO(pio);
+	return socketio_recv(pio, buf, len, flags);
 }
 
 int
 w32_send(int fd, const void *buf, size_t len, int flags)
 {
+	struct w32_io* pio;
+
 	CHECK_FD(fd);
-	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
-	return socketio_send(fd_table.w32_ios[fd], buf, len, flags);
+	pio = fd_table.w32_ios[fd];
+
+	/* AF_UNIX send - use native Winsock send */
+	if (IS_AFUNIX_WINSOCK(pio)) {
+		int ret = send((SOCKET)pio->handle, (const char*)buf, (int)len, flags);
+		if (ret == SOCKET_ERROR) {
+			errno = errno_from_WSAError(WSAGetLastError());
+			return -1;
+		}
+		return ret;
+	}
+
+	CHECK_SOCK_IO(pio);
+	return socketio_send(pio, buf, len, flags);
 }
 
 
 int
 w32_shutdown(int fd, int how)
 {
+	struct w32_io* pio;
+
 	debug4("shutdown - fd:%d how:%d", fd, how);
 	CHECK_FD(fd);
-	CHECK_SOCK_IO(fd_table.w32_ios[fd]);
-	return socketio_shutdown(fd_table.w32_ios[fd], how);
+	pio = fd_table.w32_ios[fd];
+
+	/* AF_UNIX shutdown - use native Winsock shutdown */
+	if (IS_AFUNIX_WINSOCK(pio)) {
+		int ret;
+		ret = afunix_shutdown(pio, how);
+		if (ret == SOCKET_ERROR) {
+			errno = errno_from_WSAError(WSAGetLastError());
+			return -1;
+		}
+		return 0;
+	}
+
+	CHECK_SOCK_IO(pio);
+	return socketio_shutdown(pio, how);
 }
 
 int
@@ -794,9 +975,17 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 	 */
 	for (int i = 0; i < fds; i++) {
 		if (readfds && FD_ISSET(i, readfds)) {
-			w32_io_on_select(fd_table.w32_ios[i], TRUE);
-			if ((fd_table.w32_ios[i]->type == SOCK_FD) &&
-			    (fd_table.w32_ios[i]->internal.state == SOCK_LISTENING)) {
+			/* Skip socketio_on_select for AF_UNIX sockets */
+			if (IS_AFUNIX_WINSOCK(fd_table.w32_ios[i])) {
+				/* AF_UNIX: no async event setup needed */
+			} else {
+				w32_io_on_select(fd_table.w32_ios[i], TRUE);
+			}
+			/* Only TCP listening sockets use overlapped events in select */
+			if (IS_AFUNIX_WINSOCK(fd_table.w32_ios[i])) {
+				/* AF_UNIX: handled via polling below */
+			} else if ((fd_table.w32_ios[i]->type == SOCK_FD) &&
+				    (fd_table.w32_ios[i]->internal.state == SOCK_LISTENING)) {
 				if (num_events == SELECT_EVENT_LIMIT) {
 					debug3("select - ERROR: max #events breach");
 					errno = ENOMEM;
@@ -807,9 +996,17 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 		}
 
 		if (writefds && FD_ISSET(i, writefds)) {
-			w32_io_on_select(fd_table.w32_ios[i], FALSE);
-			if ((fd_table.w32_ios[i]->type == SOCK_FD) &&
-			    (fd_table.w32_ios[i]->internal.state == SOCK_CONNECTING)) {
+			/* Skip socketio_on_select for AF_UNIX sockets */
+			if (IS_AFUNIX_WINSOCK(fd_table.w32_ios[i])) {
+				/* AF_UNIX: no async event setup needed */
+			} else {
+				w32_io_on_select(fd_table.w32_ios[i], FALSE);
+			}
+			/* Only TCP connecting sockets use overlapped events in select */
+			if (IS_AFUNIX_WINSOCK(fd_table.w32_ios[i])) {
+				/* AF_UNIX: handled via polling below */
+			} else if ((fd_table.w32_ios[i]->type == SOCK_FD) &&
+				    (fd_table.w32_ios[i]->internal.state == SOCK_CONNECTING)) {
 				if (num_events == SELECT_EVENT_LIMIT) {
 					debug3("select - ERROR: max #events reached for select");
 					errno = ENOMEM;
@@ -827,14 +1024,28 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 	/* see if any io is ready */
 	for (i = 0; i < fds; i++) {
 		if (readfds && FD_ISSET(i, readfds)) {
-			if (w32_io_is_io_available(fd_table.w32_ios[i], TRUE)) {
+			struct w32_io* pio = fd_table.w32_ios[i];
+			BOOL ready = FALSE;
+			if (pio->internal.afunix_state == AFUNIX_LISTENING) {
+				ready = afunix_is_io_available(pio, TRUE);
+			} else {
+				ready = w32_io_is_io_available(pio, TRUE);
+			}
+			if (ready) {
 				FD_SET(i, &read_ready_fds);
 				out_ready_fds++;
 			}
 		}
 
 		if (writefds && FD_ISSET(i, writefds)) {
-			if (w32_io_is_io_available(fd_table.w32_ios[i], FALSE)) {
+			struct w32_io* pio = fd_table.w32_ios[i];
+			BOOL ready = FALSE;
+			if (pio->internal.afunix_state == AFUNIX_LISTENING) {
+				ready = afunix_is_io_available(pio, TRUE);
+			} else {
+				ready = w32_io_is_io_available(pio, FALSE);
+			}
+			if (ready) {
 				FD_SET(i, &write_ready_fds);
 				out_ready_fds++;
 			}
@@ -889,13 +1100,16 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 		for (i = 0; i < fds; i++)
 			if (FD_ISSET(i, readfds)) {
 				if (FD_ISSET(i, &read_ready_fds)) {
-					/* for connect() initiated sockets finish WSA connect process*/
-					if ((fd_table.w32_ios[i]->type == SOCK_FD) &&
-						((fd_table.w32_ios[i]->internal.state == SOCK_CONNECTING)))
-						if (socketio_finish_connect(fd_table.w32_ios[i]) != 0) {
+					struct w32_io* pio = fd_table.w32_ios[i];
+					/* For TCP connect() initiated sockets finish WSA connect process */
+					if ((!IS_AFUNIX_WINSOCK(pio) &&
+					    (pio->type == SOCK_FD) &&
+					    (pio->internal.state == SOCK_CONNECTING))) {
+						if (socketio_finish_connect(pio) != 0) {
 							/* async connect failed, error will be picked up by recv or send */
 							errno = 0;
 						}
+					}
 				} else
 					FD_CLR(i, readfds);
 			}
@@ -904,13 +1118,16 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 		for (i = 0; i < fds; i++)
 			if (FD_ISSET(i, writefds)) {
 				if (FD_ISSET(i, &write_ready_fds)) {
-					/* for connect() initiated sockets finish WSA connect process*/
-					if ((fd_table.w32_ios[i]->type == SOCK_FD) &&
-					    ((fd_table.w32_ios[i]->internal.state == SOCK_CONNECTING)))
-						if (socketio_finish_connect(fd_table.w32_ios[i]) != 0) {
+					struct w32_io* pio = fd_table.w32_ios[i];
+					/* For TCP connect() initiated sockets finish WSA connect process */
+					if ((!IS_AFUNIX_WINSOCK(pio) &&
+					    (pio->type == SOCK_FD) &&
+					    (pio->internal.state == SOCK_CONNECTING))) {
+						if (socketio_finish_connect(pio) != 0) {
 							/* async connect failed, error will be picked up by recv or send */
 							errno = 0;
 						}
+					}
 				} else
 					FD_CLR(i, writefds);
 			}

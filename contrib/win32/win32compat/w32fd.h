@@ -60,9 +60,27 @@ enum w32_io_type {
 
 enum w32_io_sock_state {
 	SOCK_INITIALIZED = 0,
-	SOCK_LISTENING = 1,	/*listen called on socket*/
+	SOCK_LISTENING = 1,	/*listen called on socket (TCP)*/
 	SOCK_CONNECTING = 2,	/*connect called on socket, connect is in progress*/
 	SOCK_READY = 3		/*recv and send can be done*/
+};
+
+enum w32_io_afunix_state {
+	AFUNIX_INITIALIZED = 0,
+	AFUNIX_LISTENING = 1,
+	AFUNIX_READY = 2
+};
+
+/*
+ * AF_UNIX backend selected for this w32_io.
+ *   AFUNIX_BACKEND_NONE   - not an AF_UNIX socket
+ *   AFUNIX_BACKEND_WINSOCK - native Windows AF_UNIX (filesystem path)
+ *   AFUNIX_BACKEND_PIPE   - legacy named-pipe IPC (\\.\pipe\...)
+ */
+enum w32_io_afunix_backend {
+	AFUNIX_BACKEND_NONE = 0,
+	AFUNIX_BACKEND_WINSOCK = 1,
+	AFUNIX_BACKEND_PIPE = 2
 };
 
 /*
@@ -118,6 +136,8 @@ struct w32_io {
 	struct {
 		enum w32_io_sock_state state;
 		void* context;
+		enum w32_io_afunix_state afunix_state;
+		enum w32_io_afunix_backend afunix_backend;
 	}internal;
 };
 
