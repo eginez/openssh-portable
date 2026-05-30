@@ -410,13 +410,17 @@ w32_accept(int fd, struct sockaddr* addr, int* addrlen)
 
 	/* AF_UNIX accept - use standard POSIX accept */
 	if (listen_pio->internal.afunix_state == AFUNIX_LISTENING) {
-		int addrlen_int;
-		addrlen_int = addrlen ? *addrlen : (int)sizeof(int);
-		conn_sock = accept((SOCKET)listen_pio->handle, addr, addrlen ? &addrlen_int : NULL);
+		int addrlen_int = 0;
+		if (addrlen != NULL)
+			addrlen_int = *addrlen;
+		conn_sock = accept((SOCKET)listen_pio->handle, addr,
+		    addrlen != NULL ? &addrlen_int : NULL);
 		if (conn_sock == INVALID_SOCKET) {
 			errno = errno_from_WSAError(WSAGetLastError());
 			return -1;
 		}
+		if (addrlen != NULL)
+			*addrlen = addrlen_int;
 		min_index = fd_table_get_min_index();
 		if (min_index == -1) {
 			closesocket(conn_sock);
