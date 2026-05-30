@@ -361,6 +361,19 @@ afunix_is_io_available(struct w32_io* pio, BOOL rd)
 		return select(0, NULL, &set, NULL, &tv) > 0;
 }
 
+/* True iff sun_path looks like a Windows named pipe (\\?\pipe\ or \\.\pipe\). */
+static int
+afunix_path_is_named_pipe(const char *path)
+{
+	if (path == NULL)
+		return 0;
+	if (strncmp(path, "\\\\.\\pipe\\", 9) == 0)
+		return 1;
+	if (strncmp(path, "\\\\?\\pipe\\", 9) == 0)
+		return 1;
+	return 0;
+}
+
 int
 w32_socket(int domain, int type, int protocol)
 {
@@ -565,11 +578,28 @@ w32_connect(int fd, const struct sockaddr* name, int namelen)
 	pio = fd_table.w32_ios[fd];
 
 	if (IS_AFUNIX_WINSOCK(pio)) {
-		int ret = connect((SOCKET)pio->handle, name, namelen);
-		if (ret == SOCKET_ERROR) {
+		struct sockaddr_un* addr = (struct sockaddr_un*)name;
+		/*
+		 * If the target is a named pipe, the Winsock AF_UNIX SOCKET we
+		 * created at socket() can't speak it. Close the SOCKET, convert
+		 * this pio to the legacy named-pipe backend, and delegate to
+		 * fileio_connect (which CreateFile()s the pipe).
+		 */
+		if (afunix_path_is_named_pipe(addr->sun_path)) {
+			if (pio->handle != NULL && pio->handle != INVALID_HANDLE_VALUE)
+				closesocket((SOCKET)pio->handle);
+			pio->handle = INVALID_HANDLE_VALUE;
+			pio->type = NONSOCK_FD;
+			pio->internal.afunix_backend = AFUNIX_BACKEND_PIPE;
+			pio->internal.afunix_state = AFUNIX_INITIALIZED;
+			return fileio_connect(pio, addr->sun_path);
+		}
+
+		if (connect((SOCKET)pio->handle, name, namelen) == SOCKET_ERROR) {
 			errno = errno_from_WSAError(WSAGetLastError());
 			return -1;
 		}
+		pio->internal.afunix_state = AFUNIX_READY;
 		return 0;
 	}
 
