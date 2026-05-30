@@ -837,11 +837,17 @@ w32_close(int fd)
 
 	debug4("close - io:%p, type:%d, fd:%d, table_index:%d", pio, pio->type, fd,
 		pio->table_index);
-	
-	if (pio->type == SOCK_FD)
+
+	if (IS_AFUNIX_WINSOCK(pio)) {
+		if (pio->handle != NULL && pio->handle != INVALID_HANDLE_VALUE)
+			closesocket((SOCKET)pio->handle);
+		free(pio);
+		r = 0;
+	} else if (pio->type == SOCK_FD) {
 		r = socketio_close(pio);
-	else
-		r = fileio_close(pio);		
+	} else {
+		r = fileio_close(pio);
+	}
 
 	fd_table_clear(fd);
 	return r;
