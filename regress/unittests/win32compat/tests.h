@@ -1,6 +1,7 @@
 #pragma once
 void signal_tests();
 void socket_tests();
+void afunix_tests();
 void file_tests();
 void miscellaneous_tests();
 
