@@ -59,6 +59,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#ifdef WINDOWS
+#include <direct.h>
+#endif
 #include <unistd.h>
 #include <limits.h>
 
@@ -208,6 +211,27 @@ auth_input_request_forwarding(struct ssh *ssh, struct passwd * pw)
 	/* Temporarily drop privileged uid for mkdir/bind. */
 	temporarily_use_uid(pw);
 
+#ifdef WINDOWS
+	/*
+	 * Use a filesystem path backed by native Windows AF_UNIX (Win10 1803+).
+	 * The resulting socket is reachable by Windows AF_UNIX clients (e.g.
+	 * ssh-add.exe in PowerShell) via $env:SSH_AUTH_SOCK. The path lives
+	 * under /tmp/, which Win32-OpenSSH's mkdtemp resolves to a drive-
+	 * relative path; ensure /tmp exists.
+	 */
+	_mkdir("/tmp");
+	auth_sock_dir = xstrdup("/tmp/openssh-agent-XXXXXX");
+
+	if (mkdtemp(auth_sock_dir) == NULL) {
+		error_f("mkdtemp failed for agent socket dir");
+		goto authsock_err;
+	}
+
+	xasprintf(&auth_sock_name, "%s/agent", auth_sock_dir);
+
+	/* Start a Unix listener on auth_sock_name. */
+	sock = unix_listener(auth_sock_name, SSH_LISTEN_BACKLOG, 0);
+#else
 	/* Allocate a buffer for the socket name, and format the name. */
 	auth_sock_dir = xstrdup("/tmp/ssh-XXXXXXXXXX");
 
@@ -227,6 +251,8 @@ auth_input_request_forwarding(struct ssh *ssh, struct passwd * pw)
 	/* Start a Unix listener on auth_sock_name. */
 	sock = unix_listener(auth_sock_name, SSH_LISTEN_BACKLOG, 0);
 
+#endif /* WINDOWS */
+
 	/* Restore the privileged uid. */
 	restore_uid();
 
@@ -244,16 +270,16 @@ auth_input_request_forwarding(struct ssh *ssh, struct passwd * pw)
 
  authsock_err:
 	free(auth_sock_name);
+	auth_sock_name = NULL;
 	if (auth_sock_dir != NULL) {
 		temporarily_use_uid(pw);
 		rmdir(auth_sock_dir);
 		restore_uid();
 		free(auth_sock_dir);
+		auth_sock_dir = NULL;
 	}
 	if (sock != -1)
 		close(sock);
-	auth_sock_name = NULL;
-	auth_sock_dir = NULL;
 	return 0;
 }
 
