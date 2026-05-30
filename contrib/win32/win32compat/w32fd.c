@@ -343,17 +343,22 @@ afunix_shutdown(struct w32_io* pio, int how)
 static BOOL
 afunix_is_io_available(struct w32_io* pio, BOOL rd)
 {
-	fd_set read_set;
-	struct timeval tv;
+	fd_set set;
+	struct timeval tv = {0, 0};
+	SOCKET s = (SOCKET)pio->handle;
 
-	if (rd && pio->internal.afunix_state == AFUNIX_LISTENING) {
-		FD_ZERO(&read_set);
-		FD_SET((SOCKET)pio->handle, &read_set);
-		tv.tv_sec = 0;
-		tv.tv_usec = 0;
-		return select(0, &read_set, NULL, NULL, &tv) > 0;
-	}
-	return FALSE;
+	if (pio->internal.afunix_backend != AFUNIX_BACKEND_WINSOCK)
+		return FALSE;
+	if (s == (SOCKET)NULL || s == (SOCKET)INVALID_HANDLE_VALUE)
+		return FALSE;
+
+	FD_ZERO(&set);
+	FD_SET(s, &set);
+
+	if (rd)
+		return select(0, &set, NULL, NULL, &tv) > 0;
+	else
+		return select(0, NULL, &set, NULL, &tv) > 0;
 }
 
 int
@@ -1036,7 +1041,7 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 		if (readfds && FD_ISSET(i, readfds)) {
 			struct w32_io* pio = fd_table.w32_ios[i];
 			BOOL ready = FALSE;
-			if (pio->internal.afunix_state == AFUNIX_LISTENING) {
+			if (IS_AFUNIX_WINSOCK(pio)) {
 				ready = afunix_is_io_available(pio, TRUE);
 			} else {
 				ready = w32_io_is_io_available(pio, TRUE);
@@ -1050,8 +1055,8 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 		if (writefds && FD_ISSET(i, writefds)) {
 			struct w32_io* pio = fd_table.w32_ios[i];
 			BOOL ready = FALSE;
-			if (pio->internal.afunix_state == AFUNIX_LISTENING) {
-				ready = afunix_is_io_available(pio, TRUE);
+			if (IS_AFUNIX_WINSOCK(pio)) {
+				ready = afunix_is_io_available(pio, FALSE);
 			} else {
 				ready = w32_io_is_io_available(pio, FALSE);
 			}
