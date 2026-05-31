@@ -55,6 +55,21 @@
 #include "debug.h"
 #include "userenv.h"
 
+/*
+ * Undefine POSIX→w32 macro wrappers so AF_UNIX Winsock code in this file
+ * calls the real Winsock functions, not the w32_* wrappers (which would
+ * recurse infinitely).
+ */
+#undef socket
+#undef accept
+#undef bind
+#undef listen
+#undef connect
+#undef shutdown
+#undef select
+#undef recv
+#undef send
+
 /* internal table that stores the fd to w32_io mapping*/
 struct w32fd_table {
 	w32_fd_set occupied;		/*bit map for tracking occipied table entries*/
@@ -343,7 +358,9 @@ afunix_shutdown(struct w32_io* pio, int how)
 static BOOL
 afunix_is_io_available(struct w32_io* pio, BOOL rd)
 {
-	fd_set set;
+#undef fd_set
+#undef timeval
+	struct fd_set set;
 	struct timeval tv = {0, 0};
 	SOCKET s = (SOCKET)pio->handle;
 
@@ -352,13 +369,18 @@ afunix_is_io_available(struct w32_io* pio, BOOL rd)
 	if (s == (SOCKET)NULL || s == (SOCKET)INVALID_HANDLE_VALUE)
 		return FALSE;
 
-	FD_ZERO(&set);
-	FD_SET(s, &set);
+	set.fd_count = 1;
+	set.fd_array[0] = s;
 
+	BOOL ret;
 	if (rd)
-		return select(0, &set, NULL, NULL, &tv) > 0;
+		ret = select(0, &set, NULL, NULL, &tv) > 0;
 	else
-		return select(0, NULL, &set, NULL, &tv) > 0;
+		ret = select(0, NULL, &set, NULL, &tv) > 0;
+
+#define fd_set w32_fd_set
+#define timeval w32_timeval
+	return ret;
 }
 
 /* True iff sun_path looks like a Windows named pipe (\\?\pipe\ or \\.\pipe\). */
@@ -780,22 +802,34 @@ w32_open(const char *pathname, int flags, ... /* arg */)
 int
 w32_read(int fd, void *dst, size_t max)
 {
-	CHECK_FD(fd);
-	if (fd_table.w32_ios[fd]->type == SOCK_FD)
-		return socketio_recv(fd_table.w32_ios[fd], dst, max, 0);
+	struct w32_io* pio;
 
-	return fileio_read(fd_table.w32_ios[fd], dst, max);
+	CHECK_FD(fd);
+	pio = fd_table.w32_ios[fd];
+	if (pio->type == SOCK_FD) {
+		if (IS_AFUNIX_WINSOCK(pio))
+			return w32_recv(fd, dst, max, 0);
+		return socketio_recv(pio, dst, max, 0);
+	}
+
+	return fileio_read(pio, dst, max);
 }
 
 int
 w32_write(int fd, const void *buf, size_t max)
 {
+	struct w32_io* pio;
+
 	CHECK_FD(fd);
+	pio = fd_table.w32_ios[fd];
 
-	if (fd_table.w32_ios[fd]->type == SOCK_FD)
-		return socketio_send(fd_table.w32_ios[fd], buf, max, 0);
+	if (pio->type == SOCK_FD) {
+		if (IS_AFUNIX_WINSOCK(pio))
+			return w32_send(fd, buf, max, 0);
+		return socketio_send(pio, buf, max, 0);
+	}
 
-	return fileio_write_wrapper(fd_table.w32_ios[fd], buf, max);
+	return fileio_write_wrapper(pio, buf, max);
 }
 
 int
@@ -955,6 +989,7 @@ w32_fcntl(int fd, int cmd, ... /* arg */)
 }
 
 #define SELECT_EVENT_LIMIT 512
+#define AFUNIX_SELECT_POLL_MS 50
 int
 w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* exceptfds, const struct timeval *timeout)
 {
@@ -963,6 +998,7 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 	HANDLE events[SELECT_EVENT_LIMIT];
 	int num_events = 0;
 	int in_set_fds = 0, out_ready_fds = 0, i;
+	BOOL has_afunix_fds = FALSE;
 
 	errno = 0;
 	/* TODO - the size of these can be reduced based on fds */
@@ -1020,6 +1056,8 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 	 */
 	for (int i = 0; i < fds; i++) {
 		if (readfds && FD_ISSET(i, readfds)) {
+			if (IS_AFUNIX_WINSOCK(fd_table.w32_ios[i]))
+				has_afunix_fds = TRUE;
 			/* Skip socketio_on_select for AF_UNIX sockets */
 			if (IS_AFUNIX_WINSOCK(fd_table.w32_ios[i])) {
 				/* AF_UNIX: no async event setup needed */
@@ -1041,6 +1079,8 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 		}
 
 		if (writefds && FD_ISSET(i, writefds)) {
+			if (IS_AFUNIX_WINSOCK(fd_table.w32_ios[i]))
+				has_afunix_fds = TRUE;
 			/* Skip socketio_on_select for AF_UNIX sockets */
 			if (IS_AFUNIX_WINSOCK(fd_table.w32_ios[i])) {
 				/* AF_UNIX: no async event setup needed */
@@ -1115,6 +1155,14 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 			else
 				time_rem = INFINITE;
 
+			/*
+			 * Native AF_UNIX sockets are polled via afunix_is_io_available()
+			 * and don't provide waitable handles here, so recheck them
+			 * periodically instead of sleeping forever.
+			 */
+			if (has_afunix_fds && time_rem > AFUNIX_SELECT_POLL_MS)
+				time_rem = AFUNIX_SELECT_POLL_MS;
+
 			if (0 != wait_for_any_event(events, num_events, (DWORD)time_rem))
 				return -1;
 
@@ -1122,14 +1170,26 @@ w32_select(int fds, w32_fd_set* readfds, w32_fd_set* writefds, w32_fd_set* excep
 			out_ready_fds = 0;
 			for (int i = 0; i < fds; i++) {
 				if (readfds && FD_ISSET(i, readfds)) {
-					if (w32_io_is_io_available(fd_table.w32_ios[i], TRUE)) {
+					struct w32_io* pio = fd_table.w32_ios[i];
+					BOOL ready = FALSE;
+					if (IS_AFUNIX_WINSOCK(pio))
+						ready = afunix_is_io_available(pio, TRUE);
+					else
+						ready = w32_io_is_io_available(pio, TRUE);
+					if (ready) {
 						FD_SET(i, &read_ready_fds);
 						out_ready_fds++;
 					}
 				}
 
 				if (writefds && FD_ISSET(i, writefds)) {
-					if (w32_io_is_io_available(fd_table.w32_ios[i], FALSE)) {
+					struct w32_io* pio = fd_table.w32_ios[i];
+					BOOL ready = FALSE;
+					if (IS_AFUNIX_WINSOCK(pio))
+						ready = afunix_is_io_available(pio, FALSE);
+					else
+						ready = w32_io_is_io_available(pio, FALSE);
+					if (ready) {
 						FD_SET(i, &write_ready_fds);
 						out_ready_fds++;
 					}

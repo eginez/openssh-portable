@@ -8,6 +8,7 @@
 #include "includes.h"
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <unistd.h>
 #include <direct.h>
 #include "../test_helper/test_helper.h"
 #include "tests.h"
@@ -20,6 +21,7 @@ afunix_tests(void)
 	int srv, cli, acc;
 	struct sockaddr_un addr;
 	char buf[16];
+	char reply[16];
 	ssize_t n;
 
 	_mkdir("/tmp");
@@ -49,6 +51,47 @@ afunix_tests(void)
 		n = recv(acc, buf, sizeof(buf), 0);
 		ASSERT_INT_EQ((int)n, 5);
 		ASSERT_INT_EQ(memcmp(buf, "hello", 5), 0);
+
+		close(cli);
+		close(acc);
+		close(srv);
+		(void)unlink(test_path);
+
+		TEST_DONE();
+	}
+
+	_mkdir("/tmp");
+	(void)unlink(test_path);
+
+	{
+		TEST_START("AF_UNIX read/write roundtrip");
+
+		srv = socket(AF_UNIX, SOCK_STREAM, 0);
+		ASSERT_INT_GE(srv, 0);
+
+		memset(&addr, 0, sizeof(addr));
+		addr.sun_family = AF_UNIX;
+		strncpy(addr.sun_path, test_path, sizeof(addr.sun_path) - 1);
+
+		ASSERT_INT_EQ(bind(srv, (struct sockaddr *)&addr, sizeof(addr)), 0);
+		ASSERT_INT_EQ(listen(srv, 4), 0);
+
+		cli = socket(AF_UNIX, SOCK_STREAM, 0);
+		ASSERT_INT_GE(cli, 0);
+		ASSERT_INT_EQ(connect(cli, (struct sockaddr *)&addr, sizeof(addr)), 0);
+
+		acc = accept(srv, NULL, NULL);
+		ASSERT_INT_GE(acc, 0);
+
+		ASSERT_INT_EQ(write(cli, "hello", 5), 5);
+		n = read(acc, buf, sizeof(buf));
+		ASSERT_INT_EQ((int)n, 5);
+		ASSERT_INT_EQ(memcmp(buf, "hello", 5), 0);
+
+		ASSERT_INT_EQ(write(acc, "world", 5), 5);
+		n = read(cli, reply, sizeof(reply));
+		ASSERT_INT_EQ((int)n, 5);
+		ASSERT_INT_EQ(memcmp(reply, "world", 5), 0);
 
 		close(cli);
 		close(acc);
